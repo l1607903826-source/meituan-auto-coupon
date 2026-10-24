@@ -1,105 +1,138 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-美团自动领券脚本 - GitHub Actions 版（真实可用）
+"""One coupon request; log only a fixed status and coupon count.
+
+The endpoint and response codes are unverified assumptions from a public project.
+No third-party Python packages, notifications, retries, or account data files.
 """
 
+from dataclasses import dataclass
 import json
 import os
+from pathlib import Path
 import sys
-from datetime import datetime
+from urllib import error, request
 
-try:
-    import requests
-except ImportError:
-    print("请先安装依赖: pip install requests")
-    sys.exit(1)
 
-TOKEN = os.environ.get("MEITUAN_TOKEN", "")
 API_URL = "https://media.meituan.com/fulishemini/couponActivity/sendCouponWork"
+MAX_RESPONSE_BYTES = 1_048_576
+EXIT_CODES = {
+    "success": 0,
+    "already_received": 0,
+    "no_token": 2,
+    "empty": 3,
+    "auth_failed": 4,
+    "failed": 5,
+    "error": 6,
+}
+MESSAGES = {
+    "success": "The API returned coupons; check them in Meituan.",
+    "already_received": "The API reports coupons were already received.",
+    "no_token": "MEITUAN_TOKEN is missing or blank.",
+    "empty": "No coupons returned; this run did not claim a coupon.",
+    "auth_failed": "Authorization failed; update MEITUAN_TOKEN.",
+    "failed": "The API rejected the request.",
+    "error": "Request, response, or local output could not be processed.",
+}
 
-def fen_to_yuan(fen):
-    if not fen:
-        return "0"
-    yuan = int(fen) / 100
-    return str(int(yuan)) if yuan == int(yuan) else f"{yuan:.1f}"
 
-def claim_coupons():
-    if not TOKEN:
-        print("❌ 未配置 MEITUAN_TOKEN，请在 GitHub Secrets 中添加")
-        return {"status": "no_token"}
+@dataclass(frozen=True)
+class Result:
+    status: str
+    coupon_count: int = 0
 
-    print(f"🔑 Token 已配置")
+    @property
+    def exit_code(self):
+        return EXIT_CODES[self.status]
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
 
-    payload = {"token": TOKEN, "aiScene": "", "version": 2}
+class NoRedirect(request.HTTPRedirectHandler):
+    """Keep the authorization payload on the one configured endpoint."""
 
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def post_payload(payload):
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    req = request.Request(
+        API_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "personal-coupon-action/1.0",
+        },
+        method="POST",
+    )
+    opener = request.build_opener(NoRedirect())
+    with opener.open(req, timeout=20) as response:
+        if response.status != 200:
+            raise ValueError("Unexpected HTTP status")
+        raw = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise ValueError("Response too large")
+    return json.loads(raw.decode("utf-8"))
+
+
+def interpret_response(response):
+    if not isinstance(response, dict):
+        return Result("error")
+    code = response.get("code")
+    if type(code) is not int:
+        return Result("error")
+    if code == 401:
+        return Result("auth_failed")
+    if code == 1014:
+        return Result("already_received")
+    if code != 200:
+        return Result("failed")
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return Result("error")
+    coupons = data.get("couponList", [])
+    if not isinstance(coupons, list) or any(
+        not isinstance(coupon, dict) for coupon in coupons
+    ):
+        return Result("error")
+    return Result("success", len(coupons)) if coupons else Result("empty")
+
+
+def claim(token, transport=None):
+    token = token.strip()
+    if not token:
+        return Result("no_token")
+    if transport is None:
+        transport = post_payload
     try:
-        print(f"\n{'='*40}")
-        print("🎫 正在领取美团优惠券...")
-        print(f"   接口：{API_URL}")
+        response = transport({"token": token, "aiScene": "", "version": 2})
+        return interpret_response(response)
+    except error.HTTPError as exc:
+        return Result("auth_failed" if exc.code == 401 else "failed")
+    except (error.URLError, OSError, TimeoutError, ValueError, TypeError):
+        # Exception strings and server messages may contain account data.
+        return Result("error")
 
-        resp = requests.post(API_URL, json=payload, headers=headers, timeout=15)
-        data = resp.json()
 
-        code = data.get("code", -1)
-        msg = data.get("msg", "")
+def summary_line(result):
+    return (
+        f"status={result.status}; coupon_count={result.coupon_count}; "
+        f"{MESSAGES[result.status]}"
+    )
 
-        if code == 200:
-            coupon_list = data.get("data", {}).get("couponList", [])
-            activity_name = data.get("data", {}).get("activityName", "")
-
-            if coupon_list:
-                print(f"   ✅ 成功！领取到 {len(coupon_list)} 张优惠券")
-                print(f"\n   📋 券详情：")
-                for c in coupon_list:
-                    name = c.get("couponName", "")
-                    price_limit = c.get("priceLimit", 0)
-                    coupon_value = c.get("couponValue", 0)
-                    if price_limit > 0:
-                        discount = f"满{fen_to_yuan(price_limit)}元减{fen_to_yuan(coupon_value)}元"
-                    else:
-                        discount = f"减{fen_to_yuan(coupon_value)}元"
-                    print(f"      🎟️  {name} - {discount}")
-
-                return {"status": "success", "coupon_count": len(coupon_list)}
-            else:
-                print(f"   ⚠️  接口正常，但暂无可领券")
-                return {"status": "empty", "message": "暂无可领券"}
-        elif code == 1014:
-            print(f"   ℹ️  今日已领过")
-            return {"status": "already_received", "message": "今日已领取"}
-        elif code == 401:
-            print(f"   ❌ 登录失效！请更新 MEITUAN_TOKEN")
-            return {"status": "auth_failed", "message": "Token 已过期"}
-        else:
-            print(f"   ❌ 失败：{code} - {msg}")
-            return {"status": "failed", "code": code, "message": msg}
-    except Exception as e:
-        print(f"   ❌ 异常：{str(e)}")
-        return {"status": "error", "error": str(e)}
 
 def main():
-    print("=" * 50)
-    print(f"🚀 美团自动领券 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 50)
+    result = claim(os.environ.get("MEITUAN_TOKEN", ""))
+    line = summary_line(result)
+    print(line)
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with Path(summary_path).open("a", encoding="utf-8") as output:
+                output.write(f"### Meituan coupon result\n\n{line}\n")
+        except OSError:
+            print("status=error; could not write the fixed step summary.")
+            return EXIT_CODES["error"]
+    return result.exit_code
 
-    result = claim_coupons()
-
-    status_icon = {"success": "✅", "already_received": "ℹ️ ", "empty": "📭",
-                   "auth_failed": "🔑", "failed": "❌", "error": "💥",
-                   "no_token": "❌"}.get(result["status"], "❓")
-    print(f"\n{status_icon} {result.get('message', result.get('coupon_count', '完成'))}")
-
-    with open("result.json", "w", encoding="utf-8") as f:
-        json.dump({"time": datetime.now().isoformat(), "result": result}, f,
-                  ensure_ascii=False, indent=2)
-    print("\n💾 结果已保存到 result.json")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
